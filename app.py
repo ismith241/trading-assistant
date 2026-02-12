@@ -280,12 +280,138 @@ st.dataframe(
 )
 
 # ---- Metals (separate area) ----
+# ---- Metals (separate area) ----
 st.subheader("Metals")
 st.caption("Silver trackers (separate from your equity watchlist).")
 
-# Use Stooq-native symbols (with Yahoo fallback aliases in fetch_prices):
+def _silver_siw00_proxy(period: str) -> dict:
+    """
+    SIW00 proxy:
+      - Primary: Stooq continuous silver futures (si.f) which is in cents per oz (¢/ozt) -> convert to $/oz
+      - Fallback: Yahoo SI=F (attempted as $/oz) with auto_adjust=False
+    Returns a dict shaped like make_signal() output.
+    """
+    # 1) Try Stooq continuous futures: si.f
+    try:
+        df = _stooq_read("si.f", period)
+        if not df.empty and "Close" in df.columns:
+            close = df["Close"].astype(float)
+            price_cents = float(close.iloc[-1])
+            price_dollars = price_cents / 100.0  # ¢/ozt -> $/oz
+
+            # We can reuse your signal engine by running it on the same series:
+            # Build a minimal signal using the close series we already have.
+            sma20 = sma(close, 20)
+            sma50 = sma(close, 50)
+            sma200 = sma(close, 200)
+            rsi14 = rsi(close, 14)
+
+            score = 0.0
+            reasons = ["Source: Stooq si.f (continuous), converted ¢/oz → $/oz."]
+
+            if len(close) >= 200 and not np.isnan(sma200.iloc[-1]):
+                if price_cents > float(sma200.iloc[-1]):
+                    score += 0.35
+                    reasons.append("Above 200D avg (uptrend).")
+                else:
+                    score -= 0.35
+                    reasons.append("Below 200D avg (downtrend).")
+            else:
+                reasons.append("Not enough history for 200D avg.")
+
+            if not np.isnan(sma20.iloc[-1]) and not np.isnan(sma50.iloc[-1]):
+                if float(sma20.iloc[-1]) > float(sma50.iloc[-1]):
+                    score += 0.25
+                    reasons.append("20D > 50D (positive momentum).")
+                else:
+                    score -= 0.25
+                    reasons.append("20D < 50D (weak momentum).")
+            else:
+                reasons.append("Not enough history for 20/50D averages.")
+
+            if not np.isnan(rsi14.iloc[-1]):
+                rv = float(rsi14.iloc[-1])
+                if rv < 35:
+                    score += 0.20
+                    reasons.append(f"RSI {rv:.1f} (oversold-ish).")
+                elif rv > 70:
+                    score -= 0.20
+                    reasons.append(f"RSI {rv:.1f} (overbought-ish).")
+                else:
+                    score += 0.05
+                    reasons.append(f"RSI {rv:.1f} (neutral).")
+            else:
+                reasons.append("RSI unavailable.")
+
+            rets = close.pct_change().dropna()
+            if len(rets) >= 20:
+                vol20 = float(rets.tail(20).std() * np.sqrt(252))
+                if vol20 < 0.35:
+                    score += 0.10
+                    reasons.append(f"Vol ~{vol20:.2f} (ok).")
+                else:
+                    score -= 0.10
+                    reasons.append(f"Vol ~{vol20:.2f} (high).")
+            else:
+                reasons.append("Not enough returns history for vol check.")
+
+            if score >= 0.35:
+                sig = "BUY"
+            elif score <= -0.35:
+                sig = "SELL"
+            else:
+                sig = "HOLD"
+
+            conf = float(min(1.0, max(0.0, abs(score))))
+
+            return {
+                "ticker": "SIW00 (proxy)",
+                "signal": sig,
+                "confidence": conf,
+                "price": price_dollars,
+                "status": "OK",
+                "reasons": reasons,
+            }
+    except Exception:
+        pass
+
+    # 2) Fallback: Yahoo SI=F (try to keep raw pricing)
+    try:
+        ydf = yf.download(
+            "SI=F",
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        ydf = _normalize_df(ydf)
+        if not ydf.empty and "Close" in ydf.columns:
+            close = ydf["Close"].astype(float)
+            price = float(close.iloc[-1])
+
+            # Use your existing engine for consistency (but override display ticker)
+            s = make_signal("SI=F", period)
+            s["ticker"] = "SIW00 (proxy)"
+            s["price"] = price
+            s["reasons"] = ["Source: Yahoo SI=F (fallback)."] + s.get("reasons", [])
+            return s
+    except Exception:
+        pass
+
+    return {
+        "ticker": "SIW00 (proxy)",
+        "signal": "HOLD",
+        "confidence": 0.0,
+        "price": None,
+        "status": "NO DATA",
+        "reasons": ["No data returned for SIW00 proxy (Stooq blocked and Yahoo fallback failed)."],
+    }
+
+
+# Build metals rows
 METALS = [
-    ("Silver Futures (COMEX, continuous)", "SI=F"),
+    ("Silver Futures (SIW00 proxy)", None),  # handled by proxy function
     ("Silver Spot (XAG/USD)", "XAGUSD"),
     ("SLV ETF", "SLV"),
 ]
@@ -293,7 +419,11 @@ METALS = [
 met_rows = []
 with st.spinner("Updating metals..."):
     for label, sym in METALS:
-        s = make_signal(sym, period)
+        if label == "Silver Futures (SIW00 proxy)":
+            s = _silver_siw00_proxy(period)
+        else:
+            s = make_signal(sym, period)
+
         s["name"] = label
         met_rows.append(s)
 
@@ -307,36 +437,14 @@ st.dataframe(
     hide_index=True,
 )
 
-# ---- Details ----
-st.subheader("Details")
-choices = df_view["ticker"].dropna().tolist()
-default_choice = choices[0] if choices else (tickers[0] if tickers else "SPY")
-choice = st.selectbox("Pick a ticker", options=choices if choices else [default_choice])
-
-if choice:
-    one = next((r for r in rows if r["ticker"] == choice), None)
-    if one:
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.metric("Signal", one["signal"])
-            st.metric("Confidence", f'{one["confidence"]:.2f}')
-            st.metric("Price", "—" if one["price"] is None else f'{float(one["price"]):.2f}')
-            st.write("Chart:")
-            st.write(f"https://finance.yahoo.com/quote/{choice}")
-        with c2:
-            st.write("Why:")
-            for r in one["reasons"]:
-                st.write(f"• {r}")
-
 with st.expander("Metals details"):
     met_choice = st.selectbox("Pick a metals tracker", options=[m[0] for m in METALS])
-    met_sym = next((m[1] for m in METALS if m[0] == met_choice), None)
-    met_one = next((r for r in met_rows if r["ticker"] == met_sym), None)
+    met_one = next((r for r in met_rows if r.get("name") == met_choice), None)
     if met_one:
-        st.write(f"**{met_choice}** ({met_sym})")
+        st.write(f"**{met_choice}** ({met_one.get('ticker','')})")
         st.write(
             f"Signal: **{met_one['signal']}** | Confidence: **{met_one['confidence']:.2f}** | Status: **{met_one['status']}**"
         )
         st.write("Why:")
-        for r in met_one["reasons"]:
+        for r in met_one.get("reasons", []):
             st.write(f"• {r}")
