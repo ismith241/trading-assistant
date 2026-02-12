@@ -285,7 +285,7 @@ st.caption("Silver trackers (separate from your equity watchlist).")
 
 # Use Stooq-native symbols (with Yahoo fallback aliases in fetch_prices):
 METALS = [
-    ("Silver Futures (COMEX, continuous)", "SI.F"),
+    ("Silver Futures (COMEX, continuous)", "SI=F"),
     ("Silver Spot (XAG/USD)", "XAGUSD"),
     ("SLV ETF", "SLV"),
 ]
