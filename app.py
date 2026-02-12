@@ -3,6 +3,9 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+from io import StringIO
+from urllib.request import Request, urlopen
+
 st.set_page_config(page_title="Trading Assistant (MVP)", layout="wide")
 st.title("Trading Assistant (MVP)")
 st.caption("Decision-support only. Not financial advice.")
@@ -44,16 +47,48 @@ def _trim_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     return df
 
 
+def _looks_like_stooq_symbol(ticker: str) -> bool:
+    """
+    Stooq examples:
+      - commodities futures: si.f
+      - metals/fx: xagusd
+    """
+    t = ticker.strip().upper()
+    return ("." in t) or (t.isalpha() and len(t) in (6, 7))
+
+
 def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     """
-    Stooq CSV downloader.
+    Stooq CSV downloader with a User-Agent (important for some hosted environments).
     Works for:
       - US equities/ETFs: aapl.us, spy.us
-      - Commodities futures: si.f (Silver)
+      - Commodities futures: si.f  (Silver)
       - Currencies/metals: xagusd
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    df = pd.read_csv(url)
+
+    # Some hosts get HTML/blocked responses without a User-Agent.
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; TradingAssistant/1.0; +https://streamlit.app)"
+        },
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return pd.DataFrame()
+
+    # If we got HTML instead of CSV, treat as no data
+    head = raw.lstrip()[:100].lower()
+    if head.startswith("<!doctype") or head.startswith("<html"):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(StringIO(raw))
+    except Exception:
+        return pd.DataFrame()
 
     if df is None or df.empty:
         return pd.DataFrame()
@@ -72,15 +107,21 @@ def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
 def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     """
     Fetch daily adjusted prices.
+
     Order:
-      1) yfinance (broad coverage)
-      2) Stooq fallback:
-           - US equity/ETF: <ticker>.us
-           - If ticker already looks like Stooq (e.g., SI.F, XAGUSD), try it directly
+      A) If ticker looks like a Stooq symbol (SI.F / XAGUSD), try Stooq FIRST
+      B) Then try yfinance
+      C) Then fallback Stooq candidates for US equity/ETF: <ticker>.us (and BRK-B -> brk.b.us)
     """
     ticker = ticker.strip().upper()
 
-    # 1) yfinance first
+    # A) Stooq-first for Stooq-style symbols (fixes SI.F on Streamlit Cloud)
+    if _looks_like_stooq_symbol(ticker):
+        sdf = _stooq_read(ticker.lower(), period)
+        if not sdf.empty and "Close" in sdf.columns:
+            return sdf
+
+    # B) yfinance
     try:
         df = yf.download(
             ticker,
@@ -96,27 +137,18 @@ def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 2) Stooq fallback candidates
+    # C) Stooq fallback for US equities/ETFs
     candidates: list[str] = []
 
-    # If user passed a Stooq-style symbol already (e.g., SI.F, XAGUSD), try it directly
-    if "." in ticker or (ticker.isalpha() and len(ticker) in (6, 7)):
-        candidates.append(ticker.lower())
-
-    # Plain US equity/ETF fallback
-    # Handles tickers like BRK-B by trying both brk-b.us and brk.b.us patterns
     t_low = ticker.lower()
-    candidates.append(f"{t_low}.us")
+    candidates.append(f"{t_low}.us")  # aapl.us, spy.us
     if "-" in t_low:
-        candidates.append(f"{t_low.replace('-', '.')}.us")
+        candidates.append(f"{t_low.replace('-', '.')}.us")  # brk-b -> brk.b.us
 
     for sym in candidates:
-        try:
-            sdf = _stooq_read(sym, period)
-            if not sdf.empty:
-                return sdf
-        except Exception:
-            continue
+        sdf = _stooq_read(sym, period)
+        if not sdf.empty and "Close" in sdf.columns:
+            return sdf
 
     return pd.DataFrame()
 
@@ -252,9 +284,9 @@ st.dataframe(
 st.subheader("Metals")
 st.caption("Silver trackers (separate from your equity watchlist).")
 
-# Use Stooq-native symbols to avoid yfinance flakiness in cloud:
-#  - Silver futures continuous: SI.F  (Cmdt Fut)  :contentReference[oaicite:3]{index=3}
-#  - Silver spot XAG/USD: XAGUSD       :contentReference[oaicite:4]{index=4}
+# Stooq-native symbols (most reliable on Streamlit Cloud):
+#   Silver futures continuous: SI.F
+#   Silver spot XAG/USD: XAGUSD
 METALS = [
     ("Silver Futures (COMEX, continuous)", "SI.F"),
     ("Silver Spot (XAG/USD)", "XAGUSD"),
@@ -305,7 +337,9 @@ with st.expander("Metals details"):
     met_one = next((r for r in met_rows if r["ticker"] == met_sym), None)
     if met_one:
         st.write(f"**{met_choice}** ({met_sym})")
-        st.write(f"Signal: **{met_one['signal']}** | Confidence: **{met_one['confidence']:.2f}** | Status: **{met_one['status']}**")
+        st.write(
+            f"Signal: **{met_one['signal']}** | Confidence: **{met_one['confidence']:.2f}** | Status: **{met_one['status']}**"
+        )
         st.write("Why:")
         for r in met_one["reasons"]:
             st.write(f"• {r}")
