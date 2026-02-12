@@ -139,5 +139,5 @@ st.subheader("Signals")
 st.dataframe(
     df[["ticker", "signal", "confidence", "price"]],
     use_container_width=True,
-    hide_index=T:contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}:contentReference[oaicite:2]{index=2}
-::contentReference[oaicite:3]{index=3}
+    hide_index=True
+)
