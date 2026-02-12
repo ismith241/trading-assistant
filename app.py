@@ -23,21 +23,7 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def _safe_float(x) -> float | None:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, (float, int)):
-            return float(x)
-        if pd.isna(x):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Make sure columns are single-level and trimmed."""
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
@@ -47,7 +33,6 @@ def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _trim_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    # Rough trading-day trims
     if df is None or df.empty:
         return pd.DataFrame()
     if period == "6mo":
@@ -59,24 +44,39 @@ def _trim_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     return df
 
 
-def _is_plain_us_equity_ticker(ticker: str) -> bool:
+def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     """
-    Heuristic: plain US equity/ETF tickers are typically letters/numbers with optional - or .
-    We EXCLUDE symbols like futures (=F), FX (=X), indexes (^), etc.
+    Stooq CSV downloader.
+    Works for:
+      - US equities/ETFs: aapl.us, spy.us
+      - Commodities futures: si.f (Silver)
+      - Currencies/metals: xagusd
     """
-    t = ticker.upper().strip()
-    if any(ch in t for ch in ["=", "^", "/"]):
-        return False
-    return True
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    df = pd.read_csv(url)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df.columns = [c.strip().title() for c in df.columns]
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df = _trim_period(df, period)
+    return df
 
 
-# ---------------- Data Fetch ----------------
 @st.cache_data(ttl=900)  # cache 15 minutes
 def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     """
     Fetch daily adjusted prices.
-    - Primary: yfinance (broad coverage, including many special symbols like SI=F, XAGUSD=X)
-    - Fallback: Stooq CSV for plain US equity/ETF tickers if yfinance returns empty
+    Order:
+      1) yfinance (broad coverage)
+      2) Stooq fallback:
+           - US equity/ETF: <ticker>.us
+           - If ticker already looks like Stooq (e.g., SI.F, XAGUSD), try it directly
     """
     ticker = ticker.strip().upper()
 
@@ -96,32 +96,25 @@ def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 2) Fallback for plain US tickers: Stooq
-    if not _is_plain_us_equity_ticker(ticker):
-        return pd.DataFrame()
+    # 2) Stooq fallback candidates
+    candidates: list[str] = []
 
-    # Stooq generally uses lower-case with .us for US equities/ETFs
-    candidates = [f"{ticker.lower()}.us", ticker.lower()]
+    # If user passed a Stooq-style symbol already (e.g., SI.F, XAGUSD), try it directly
+    if "." in ticker or (ticker.isalpha() and len(ticker) in (6, 7)):
+        candidates.append(ticker.lower())
+
+    # Plain US equity/ETF fallback
+    # Handles tickers like BRK-B by trying both brk-b.us and brk.b.us patterns
+    t_low = ticker.lower()
+    candidates.append(f"{t_low}.us")
+    if "-" in t_low:
+        candidates.append(f"{t_low.replace('-', '.')}.us")
 
     for sym in candidates:
         try:
-            url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-            sdf = pd.read_csv(url)
-            if sdf is None or sdf.empty:
-                continue
-
-            sdf.columns = [c.strip().title() for c in sdf.columns]
-            if "Date" not in sdf.columns or "Close" not in sdf.columns:
-                continue
-
-            sdf["Date"] = pd.to_datetime(sdf["Date"], errors="coerce")
-            sdf = sdf.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-            sdf = _trim_period(sdf, period)
-
-            # Ensure columns match expected names
-            # (Stooq typically has Open/High/Low/Close/Volume)
-            return sdf
+            sdf = _stooq_read(sym, period)
+            if not sdf.empty:
+                return sdf
         except Exception:
             continue
 
@@ -235,17 +228,16 @@ with right:
     show = st.multiselect("Show", ["BUY", "HOLD", "SELL"], default=["BUY", "HOLD", "SELL"])
     st.caption("Tip: raise Min confidence to hide weak signals.")
 
-# ---- Main signals (your input tickers) ----
+# ---- Main watchlist ----
 rows = []
 with st.spinner("Generating signals..."):
-    for t in tickers[:200]:  # allow large lists; limit prevents accidental huge runs
+    for t in tickers[:200]:
         rows.append(make_signal(t, period))
 
 df = pd.DataFrame(rows)
 df["price"] = pd.to_numeric(df["price"], errors="coerce")
 df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
 
-# Keep NO DATA rows visible unless user filters them out by confidence/show
 df_view = df[df["signal"].isin(show)].copy()
 df_view = df_view[(df_view["confidence"] >= float(min_conf)) | (df_view["status"] != "OK")]
 
@@ -256,13 +248,16 @@ st.dataframe(
     hide_index=True,
 )
 
-# ---- Metals section (separate area) ----
+# ---- Metals (separate area) ----
 st.subheader("Metals")
 st.caption("Silver trackers (separate from your equity watchlist).")
 
+# Use Stooq-native symbols to avoid yfinance flakiness in cloud:
+#  - Silver futures continuous: SI.F  (Cmdt Fut)  :contentReference[oaicite:3]{index=3}
+#  - Silver spot XAG/USD: XAGUSD       :contentReference[oaicite:4]{index=4}
 METALS = [
-    ("Silver Futures (COMEX)", "SI=F"),
-    ("Silver Spot (XAGUSD)", "XAGUSD=X"),
+    ("Silver Futures (COMEX, continuous)", "SI.F"),
+    ("Silver Spot (XAG/USD)", "XAGUSD"),
     ("SLV ETF", "SLV"),
 ]
 
@@ -304,7 +299,6 @@ if choice:
             for r in one["reasons"]:
                 st.write(f"• {r}")
 
-# Metals details quick pick
 with st.expander("Metals details"):
     met_choice = st.selectbox("Pick a metals tracker", options=[m[0] for m in METALS])
     met_sym = next((m[1] for m in METALS if m[0] == met_choice), None)
