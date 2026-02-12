@@ -64,7 +64,6 @@ def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
 
-    # Fetch with User-Agent
     try:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=20) as resp:
@@ -72,12 +71,10 @@ def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-    # If we got HTML instead of CSV, treat as no data
     head = raw.lstrip()[:200].lower()
     if head.startswith("<!doctype") or head.startswith("<html"):
         return pd.DataFrame()
 
-    # Parse CSV from memory
     try:
         df = pd.read_csv(StringIO(raw))
     except Exception:
@@ -96,53 +93,79 @@ def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     return df
 
 
+def _yahoo_get_daily(symbol: str, period: str) -> pd.DataFrame:
+    """
+    More robust Yahoo fetch:
+      1) yf.download()
+      2) yf.Ticker(symbol).history()
+    Returns dataframe with 'Close' when possible.
+    """
+    symbol = symbol.strip()
+
+    # Method 1: download
+    try:
+        df = yf.download(
+            symbol,
+            period=period,
+            interval="1d",
+            auto_adjust=False,   # IMPORTANT: futures/FX can get weird with auto_adjust=True
+            progress=False,
+            threads=False,
+        )
+        df = _normalize_df(df)
+        if not df.empty and "Close" in df.columns:
+            return df
+    except Exception:
+        pass
+
+    # Method 2: history (sometimes works when download doesn't)
+    try:
+        t = yf.Ticker(symbol)
+        h = t.history(period=period, interval="1d", auto_adjust=False)
+        h = _normalize_df(h)
+        if not h.empty and "Close" in h.columns:
+            return h
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=900)  # cache 15 minutes
 def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     """
-    Fetch daily adjusted prices.
+    Fetch daily prices.
 
     Order:
       A) If ticker looks like a Stooq symbol (SI.F / XAGUSD), try Stooq FIRST
-      B) Then try yfinance (with Yahoo aliases for Stooq symbols)
+      B) Then try Yahoo via yfinance (robust helper)
       C) Then fallback Stooq candidates for US equity/ETF: <ticker>.us (and BRK-B -> brk.b.us)
     """
     ticker = ticker.strip().upper()
 
-    # A) Stooq-first for Stooq-style symbols (fixes SI.F on Streamlit Cloud when Stooq allows it)
+    # A) Stooq-first for Stooq-style symbols
     if _looks_like_stooq_symbol(ticker):
         sdf = _stooq_read(ticker.lower(), period)
         if not sdf.empty and "Close" in sdf.columns:
             return sdf
 
-    # B) yfinance (try Yahoo aliases for Stooq symbols)
+    # B) Yahoo (try aliases for special symbols)
     yahoo_aliases = {
-        "SI.F": ["SI=F"],          # Silver futures (COMEX) on Yahoo
-        "XAGUSD": ["XAGUSD=X"],    # Silver spot on Yahoo
+        "XAGUSD": ["XAGUSD=X"],
+        "SI.F": ["SI=F"],  # if someone passes SI.F, try Yahoo futures too
     }
 
     for ysym in [ticker] + yahoo_aliases.get(ticker, []):
-        try:
-            df = yf.download(
-                ysym,
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
-            df = _normalize_df(df)
-            if not df.empty and "Close" in df.columns:
-                return df
-        except Exception:
-            continue
+        df = _yahoo_get_daily(ysym, period)
+        if not df.empty and "Close" in df.columns:
+            return df
 
     # C) Stooq fallback for US equities/ETFs
     candidates: list[str] = []
-
     t_low = ticker.lower()
-    candidates.append(f"{t_low}.us")  # aapl.us, spy.us
+    candidates.append(f"{t_low}.us")
     if "-" in t_low:
-        candidates.append(f"{t_low.replace('-', '.')}.us")  # brk-b -> brk.b.us
+        candidates.append(f"{t_low.replace('-', '.')}.us")
 
     for sym in candidates:
         sdf = _stooq_read(sym, period)
@@ -279,125 +302,122 @@ st.dataframe(
     hide_index=True,
 )
 
-# ---- Metals (separate area) ----
+
 # ---- Metals (separate area) ----
 st.subheader("Metals")
 st.caption("Silver trackers (separate from your equity watchlist).")
 
+
 def _silver_siw00_proxy(period: str) -> dict:
     """
-    SIW00 proxy:
-      - Primary: Stooq continuous silver futures (si.f) which is in cents per oz (¢/ozt) -> convert to $/oz
-      - Fallback: Yahoo SI=F (attempted as $/oz) with auto_adjust=False
-    Returns a dict shaped like make_signal() output.
+    SIW00 proxy (continuous-like):
+      - Try Stooq continuous silver futures: si.f (often in cents). If it looks like cents, convert.
+      - Fallback: robust Yahoo list using _yahoo_get_daily (SI=F + common contract symbols).
     """
-    # 1) Try Stooq continuous futures: si.f
-    try:
-        df = _stooq_read("si.f", period)
-        if not df.empty and "Close" in df.columns:
-            close = df["Close"].astype(float)
-            price_cents = float(close.iloc[-1])
-            price_dollars = price_cents / 100.0  # ¢/ozt -> $/oz
+    # 1) Stooq continuous futures: si.f
+    sdf = _stooq_read("si.f", period)
+    if not sdf.empty and "Close" in sdf.columns:
+        close = sdf["Close"].astype(float)
+        raw_price = float(close.iloc[-1])
 
-            # We can reuse your signal engine by running it on the same series:
-            # Build a minimal signal using the close series we already have.
-            sma20 = sma(close, 20)
-            sma50 = sma(close, 50)
-            sma200 = sma(close, 200)
-            rsi14 = rsi(close, 14)
+        # Heuristic conversion: if it's huge (like 7000-9000), it's probably cents -> convert to dollars
+        price = raw_price / 100.0 if raw_price > 500 else raw_price
 
-            score = 0.0
-            reasons = ["Source: Stooq si.f (continuous), converted ¢/oz → $/oz."]
+        # Use the close series for scoring; scoring doesn't care about units scaling.
+        sma20 = sma(close, 20)
+        sma50 = sma(close, 50)
+        sma200 = sma(close, 200)
+        rsi14 = rsi(close, 14)
 
-            if len(close) >= 200 and not np.isnan(sma200.iloc[-1]):
-                if price_cents > float(sma200.iloc[-1]):
-                    score += 0.35
-                    reasons.append("Above 200D avg (uptrend).")
-                else:
-                    score -= 0.35
-                    reasons.append("Below 200D avg (downtrend).")
+        score = 0.0
+        reasons = ["Source: Stooq si.f (continuous)."]
+
+        if raw_price > 500:
+            reasons.append("Converted cents → dollars for display.")
+
+        if len(close) >= 200 and not np.isnan(sma200.iloc[-1]):
+            if raw_price > float(sma200.iloc[-1]):
+                score += 0.35
+                reasons.append("Above 200D avg (uptrend).")
             else:
-                reasons.append("Not enough history for 200D avg.")
+                score -= 0.35
+                reasons.append("Below 200D avg (downtrend).")
+        else:
+            reasons.append("Not enough history for 200D avg.")
 
-            if not np.isnan(sma20.iloc[-1]) and not np.isnan(sma50.iloc[-1]):
-                if float(sma20.iloc[-1]) > float(sma50.iloc[-1]):
-                    score += 0.25
-                    reasons.append("20D > 50D (positive momentum).")
-                else:
-                    score -= 0.25
-                    reasons.append("20D < 50D (weak momentum).")
+        if not np.isnan(sma20.iloc[-1]) and not np.isnan(sma50.iloc[-1]):
+            if float(sma20.iloc[-1]) > float(sma50.iloc[-1]):
+                score += 0.25
+                reasons.append("20D > 50D (positive momentum).")
             else:
-                reasons.append("Not enough history for 20/50D averages.")
+                score -= 0.25
+                reasons.append("20D < 50D (weak momentum).")
+        else:
+            reasons.append("Not enough history for 20/50D averages.")
 
-            if not np.isnan(rsi14.iloc[-1]):
-                rv = float(rsi14.iloc[-1])
-                if rv < 35:
-                    score += 0.20
-                    reasons.append(f"RSI {rv:.1f} (oversold-ish).")
-                elif rv > 70:
-                    score -= 0.20
-                    reasons.append(f"RSI {rv:.1f} (overbought-ish).")
-                else:
-                    score += 0.05
-                    reasons.append(f"RSI {rv:.1f} (neutral).")
+        if not np.isnan(rsi14.iloc[-1]):
+            rv = float(rsi14.iloc[-1])
+            if rv < 35:
+                score += 0.20
+                reasons.append(f"RSI {rv:.1f} (oversold-ish).")
+            elif rv > 70:
+                score -= 0.20
+                reasons.append(f"RSI {rv:.1f} (overbought-ish).")
             else:
-                reasons.append("RSI unavailable.")
+                score += 0.05
+                reasons.append(f"RSI {rv:.1f} (neutral).")
+        else:
+            reasons.append("RSI unavailable.")
 
-            rets = close.pct_change().dropna()
-            if len(rets) >= 20:
-                vol20 = float(rets.tail(20).std() * np.sqrt(252))
-                if vol20 < 0.35:
-                    score += 0.10
-                    reasons.append(f"Vol ~{vol20:.2f} (ok).")
-                else:
-                    score -= 0.10
-                    reasons.append(f"Vol ~{vol20:.2f} (high).")
+        rets = close.pct_change().dropna()
+        if len(rets) >= 20:
+            vol20 = float(rets.tail(20).std() * np.sqrt(252))
+            if vol20 < 0.35:
+                score += 0.10
+                reasons.append(f"Vol ~{vol20:.2f} (ok).")
             else:
-                reasons.append("Not enough returns history for vol check.")
+                score -= 0.10
+                reasons.append(f"Vol ~{vol20:.2f} (high).")
+        else:
+            reasons.append("Not enough returns history for vol check.")
 
-            if score >= 0.35:
-                sig = "BUY"
-            elif score <= -0.35:
-                sig = "SELL"
-            else:
-                sig = "HOLD"
+        if score >= 0.35:
+            sig = "BUY"
+        elif score <= -0.35:
+            sig = "SELL"
+        else:
+            sig = "HOLD"
 
-            conf = float(min(1.0, max(0.0, abs(score))))
+        conf = float(min(1.0, max(0.0, abs(score))))
 
-            return {
-                "ticker": "SIW00 (proxy)",
-                "signal": sig,
-                "confidence": conf,
-                "price": price_dollars,
-                "status": "OK",
-                "reasons": reasons,
-            }
-    except Exception:
-        pass
+        return {
+            "ticker": "SIW00 (proxy)",
+            "signal": sig,
+            "confidence": conf,
+            "price": price,
+            "status": "OK",
+            "reasons": reasons,
+        }
 
-    # 2) Fallback: Yahoo SI=F (try to keep raw pricing)
-    try:
-        ydf = yf.download(
-            "SI=F",
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-        ydf = _normalize_df(ydf)
+    # 2) Yahoo fallback: try SI=F, then common contract symbols
+    yahoo_candidates = [
+        "SI=F",
+        "SIH26.CMX",  # example front month (Yahoo supports contract tickers like this)
+        "SIG26.CMX",
+        "SIZ26.CMX",
+    ]
+
+    for sym in yahoo_candidates:
+        ydf = _yahoo_get_daily(sym, period)
         if not ydf.empty and "Close" in ydf.columns:
-            close = ydf["Close"].astype(float)
-            price = float(close.iloc[-1])
+            price = float(ydf["Close"].astype(float).iloc[-1])
 
-            # Use your existing engine for consistency (but override display ticker)
-            s = make_signal("SI=F", period)
+            # Use your normal engine for scoring using this symbol
+            s = make_signal(sym, period)
             s["ticker"] = "SIW00 (proxy)"
             s["price"] = price
-            s["reasons"] = ["Source: Yahoo SI=F (fallback)."] + s.get("reasons", [])
+            s["reasons"] = [f"Source: Yahoo {sym} (fallback)."] + s.get("reasons", [])
             return s
-    except Exception:
-        pass
 
     return {
         "ticker": "SIW00 (proxy)",
@@ -405,13 +425,12 @@ def _silver_siw00_proxy(period: str) -> dict:
         "confidence": 0.0,
         "price": None,
         "status": "NO DATA",
-        "reasons": ["No data returned for SIW00 proxy (Stooq blocked and Yahoo fallback failed)."],
+        "reasons": ["No data returned for SIW00 proxy (Stooq and Yahoo fallbacks failed)."],
     }
 
 
-# Build metals rows
 METALS = [
-    ("Silver Futures (SIW00 proxy)", None),  # handled by proxy function
+    ("Silver Futures (SIW00 proxy)", None),
     ("Silver Spot (XAG/USD)", "XAGUSD"),
     ("SLV ETF", "SLV"),
 ]
@@ -423,7 +442,6 @@ with st.spinner("Updating metals..."):
             s = _silver_siw00_proxy(period)
         else:
             s = make_signal(sym, period)
-
         s["name"] = label
         met_rows.append(s)
 
