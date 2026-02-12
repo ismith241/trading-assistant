@@ -7,10 +7,10 @@ st.set_page_config(page_title="Trading Assistant (MVP)", layout="wide")
 st.title("Trading Assistant (MVP)")
 st.caption("Decision-support only. Not financial advice.")
 
-DEFAULT = "AAPL,MSFT,NVDA,AMZN,GOOGL,SPY"
+DEFAULT_TICKERS = "AAPL,MSFT,NVDA,AMZN,GOOGL,SPY"
 
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
@@ -23,12 +23,64 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-# ---------- Data ----------
+def _safe_float(x) -> float | None:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (float, int)):
+            return float(x)
+        if pd.isna(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Make sure columns are single-level and trimmed."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=lambda c: str(c).strip())
+    return df
+
+
+def _trim_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    # Rough trading-day trims
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if period == "6mo":
+        return df.tail(140)
+    if period == "1y":
+        return df.tail(260)
+    if period == "2y":
+        return df.tail(520)
+    return df
+
+
+def _is_plain_us_equity_ticker(ticker: str) -> bool:
+    """
+    Heuristic: plain US equity/ETF tickers are typically letters/numbers with optional - or .
+    We EXCLUDE symbols like futures (=F), FX (=X), indexes (^), etc.
+    """
+    t = ticker.upper().strip()
+    if any(ch in t for ch in ["=", "^", "/"]):
+        return False
+    return True
+
+
+# ---------------- Data Fetch ----------------
 @st.cache_data(ttl=900)  # cache 15 minutes
-def fetch(ticker: str, period: str = "1y") -> pd.DataFrame:
+def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
+    """
+    Fetch daily adjusted prices.
+    - Primary: yfinance (broad coverage, including many special symbols like SI=F, XAGUSD=X)
+    - Fallback: Stooq CSV for plain US equity/ETF tickers if yfinance returns empty
+    """
     ticker = ticker.strip().upper()
 
-    # 1) Try yfinance
+    # 1) yfinance first
     try:
         df = yf.download(
             ticker,
@@ -36,62 +88,58 @@ def fetch(ticker: str, period: str = "1y") -> pd.DataFrame:
             interval="1d",
             auto_adjust=True,
             progress=False,
+            threads=False,
         )
-
-        if df is None or df.empty:
-            raise ValueError("yfinance returned empty")
-
-        # yfinance sometimes returns MultiIndex columns on cloud
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df = df.rename(columns=lambda c: c.strip())
-        return df
+        df = _normalize_df(df)
+        if not df.empty and "Close" in df.columns:
+            return df
     except Exception:
         pass
 
-    # 2) Fallback: Stooq daily CSV (often works when yfinance is blocked/rate-limited)
-    try:
-        # For US stocks/ETFs, Stooq uses e.g. aapl.us, spy.us
-        stooq_symbol = f"{ticker.lower()}.us"
-        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-        df = pd.read_csv(url)
-
-        if df is None or df.empty:
-            return pd.DataFrame()
-
-        # Normalize headers -> Date, Open, High, Low, Close, Volume
-        df.columns = [c.strip().title() for c in df.columns]
-
-        if "Date" not in df.columns or "Close" not in df.columns:
-            return pd.DataFrame()
-
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-        # Roughly trim to match selected period (keeps app fast)
-        if period == "6mo":
-            df = df.tail(140)
-        elif period == "1y":
-            df = df.tail(260)
-        elif period == "2y":
-            df = df.tail(520)
-
-        return df
-    except Exception:
+    # 2) Fallback for plain US tickers: Stooq
+    if not _is_plain_us_equity_ticker(ticker):
         return pd.DataFrame()
 
+    # Stooq generally uses lower-case with .us for US equities/ETFs
+    candidates = [f"{ticker.lower()}.us", ticker.lower()]
 
-# ---------- Signal ----------
-def signal_for(ticker: str, period: str) -> dict:
-    df = fetch(ticker, period)
+    for sym in candidates:
+        try:
+            url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+            sdf = pd.read_csv(url)
+            if sdf is None or sdf.empty:
+                continue
+
+            sdf.columns = [c.strip().title() for c in sdf.columns]
+            if "Date" not in sdf.columns or "Close" not in sdf.columns:
+                continue
+
+            sdf["Date"] = pd.to_datetime(sdf["Date"], errors="coerce")
+            sdf = sdf.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+            sdf = _trim_period(sdf, period)
+
+            # Ensure columns match expected names
+            # (Stooq typically has Open/High/Low/Close/Volume)
+            return sdf
+        except Exception:
+            continue
+
+    return pd.DataFrame()
+
+
+# ---------------- Signal Engine ----------------
+def make_signal(ticker: str, period: str) -> dict:
+    df = fetch_prices(ticker, period)
+
     if df.empty or "Close" not in df.columns:
         return {
-            "ticker": ticker.upper(),
+            "ticker": ticker.upper().strip(),
             "signal": "HOLD",
             "confidence": 0.0,
             "price": None,
-            "reasons": ["No data returned (data source blocked or rate-limited)."],
+            "status": "NO DATA",
+            "reasons": ["No data returned (ticker unsupported by free sources or temporarily blocked)."],
         }
 
     close = df["Close"].astype(float)
@@ -105,7 +153,7 @@ def signal_for(ticker: str, period: str) -> dict:
     score = 0.0
     reasons: list[str] = []
 
-    # Long trend
+    # Long trend (200D)
     if len(close) >= 200 and not np.isnan(sma200.iloc[-1]):
         if price > float(sma200.iloc[-1]):
             score += 0.35
@@ -116,7 +164,7 @@ def signal_for(ticker: str, period: str) -> dict:
     else:
         reasons.append("Not enough history for 200D avg.")
 
-    # Momentum
+    # Momentum (20 vs 50)
     if not np.isnan(sma20.iloc[-1]) and not np.isnan(sma50.iloc[-1]):
         if float(sma20.iloc[-1]) > float(sma50.iloc[-1]):
             score += 0.25
@@ -165,44 +213,82 @@ def signal_for(ticker: str, period: str) -> dict:
     conf = float(min(1.0, max(0.0, abs(score))))
 
     return {
-        "ticker": ticker.upper(),
+        "ticker": ticker.upper().strip(),
         "signal": sig,
         "confidence": conf,
         "price": price,
+        "status": "OK",
         "reasons": reasons,
     }
 
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 left, right = st.columns([2, 1])
 
 with left:
-    tickers_text = st.text_input("Tickers (comma separated)", value=DEFAULT)
+    tickers_text = st.text_input("Tickers (comma separated)", value=DEFAULT_TICKERS)
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
 
 with right:
     min_conf = st.slider("Min confidence", 0.0, 1.0, 0.20, 0.05)
     period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
+    show = st.multiselect("Show", ["BUY", "HOLD", "SELL"], default=["BUY", "HOLD", "SELL"])
     st.caption("Tip: raise Min confidence to hide weak signals.")
 
+# ---- Main signals (your input tickers) ----
 rows = []
 with st.spinner("Generating signals..."):
-    for t in tickers[:50]:
-        rows.append(signal_for(t, period))
+    for t in tickers[:200]:  # allow large lists; limit prevents accidental huge runs
+        rows.append(make_signal(t, period))
 
 df = pd.DataFrame(rows)
 df["price"] = pd.to_numeric(df["price"], errors="coerce")
-df = df[df["confidence"] >= float(min_conf)].copy()
+df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
+
+# Keep NO DATA rows visible unless user filters them out by confidence/show
+df_view = df[df["signal"].isin(show)].copy()
+df_view = df_view[(df_view["confidence"] >= float(min_conf)) | (df_view["status"] != "OK")]
 
 st.subheader("Signals")
 st.dataframe(
-    df[["ticker", "signal", "confidence", "price"]],
+    df_view[["ticker", "signal", "confidence", "price", "status"]],
     use_container_width=True,
     hide_index=True,
 )
 
+# ---- Metals section (separate area) ----
+st.subheader("Metals")
+st.caption("Silver trackers (separate from your equity watchlist).")
+
+METALS = [
+    ("Silver Futures (COMEX)", "SI=F"),
+    ("Silver Spot (XAGUSD)", "XAGUSD=X"),
+    ("SLV ETF", "SLV"),
+]
+
+met_rows = []
+with st.spinner("Updating metals..."):
+    for label, sym in METALS:
+        s = make_signal(sym, period)
+        s["name"] = label
+        met_rows.append(s)
+
+met_df = pd.DataFrame(met_rows)
+met_df["price"] = pd.to_numeric(met_df["price"], errors="coerce")
+met_df["confidence"] = pd.to_numeric(met_df["confidence"], errors="coerce").fillna(0.0)
+
+st.dataframe(
+    met_df[["name", "ticker", "signal", "confidence", "price", "status"]],
+    use_container_width=True,
+    hide_index=True,
+)
+
+# ---- Details ----
 st.subheader("Details")
-choice = st.selectbox("Pick a ticker", options=df["ticker"].tolist() if not df.empty else tickers)
+choices = df_view["ticker"].dropna().tolist()
+default_choice = choices[0] if choices else (tickers[0] if tickers else "SPY")
+choice = st.selectbox("Pick a ticker", options=choices if choices else [default_choice])
+
 if choice:
     one = next((r for r in rows if r["ticker"] == choice), None)
     if one:
@@ -217,3 +303,15 @@ if choice:
             st.write("Why:")
             for r in one["reasons"]:
                 st.write(f"• {r}")
+
+# Metals details quick pick
+with st.expander("Metals details"):
+    met_choice = st.selectbox("Pick a metals tracker", options=[m[0] for m in METALS])
+    met_sym = next((m[1] for m in METALS if m[0] == met_choice), None)
+    met_one = next((r for r in met_rows if r["ticker"] == met_sym), None)
+    if met_one:
+        st.write(f"**{met_choice}** ({met_sym})")
+        st.write(f"Signal: **{met_one['signal']}** | Confidence: **{met_one['confidence']:.2f}** | Status: **{met_one['status']}**")
+        st.write("Why:")
+        for r in met_one["reasons"]:
+            st.write(f"• {r}")
