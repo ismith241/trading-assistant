@@ -23,6 +23,9 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
 @st.cache_data(ttl=900)  # cache 15 minutes
 def fetch(ticker: str, period: str = "1y") -> pd.DataFrame:
     df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+        # Fix: yfinance sometimes returns MultiIndex columns on cloud
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.rename(columns=lambda c: c.strip())
