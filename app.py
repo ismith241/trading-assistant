@@ -6,6 +6,9 @@ import yfinance as yf
 from io import StringIO
 from urllib.request import Request, urlopen
 
+from io import StringIO
+from urllib.request import Request, urlopen
+
 st.set_page_config(page_title="Trading Assistant (MVP)", layout="wide")
 st.title("Trading Assistant (MVP)")
 st.caption("Decision-support only. Not financial advice.")
@@ -59,13 +62,41 @@ def _looks_like_stooq_symbol(ticker: str) -> bool:
 
 def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     """
-    Stooq CSV downloader with a User-Agent (important for some hosted environments).
-    Works for:
-      - US equities/ETFs: aapl.us, spy.us
-      - Commodities futures: si.f  (Silver)
-      - Currencies/metals: xagusd
+    Stooq CSV downloader (Cloud-safe).
+    Adds a User-Agent because some hosted environments get HTML/blocked responses otherwise.
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+
+    # Fetch with User-Agent
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return pd.DataFrame()
+
+    # If we got HTML instead of CSV, treat as no data
+    head = raw.lstrip()[:200].lower()
+    if head.startswith("<!doctype") or head.startswith("<html"):
+        return pd.DataFrame()
+
+    # Parse CSV from memory
+    try:
+        df = pd.read_csv(StringIO(raw))
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df.columns = [c.strip().title() for c in df.columns]
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    df = _trim_period(df, period)
+    return df
 
     # Some hosts get HTML/blocked responses without a User-Agent.
     req = Request(
