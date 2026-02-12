@@ -9,9 +9,11 @@ st.caption("Decision-support only. Not financial advice.")
 
 DEFAULT = "AAPL,MSFT,NVDA,AMZN,GOOGL,SPY"
 
+
 # ---------- Helpers ----------
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
+
 
 def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     d = s.diff()
@@ -20,42 +22,92 @@ def rsi(s: pd.Series, n: int = 14) -> pd.Series:
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
+# ---------- Data ----------
 @st.cache_data(ttl=900)  # cache 15 minutes
 def fetch(ticker: str, period: str = "1y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
-        # Fix: yfinance sometimes returns MultiIndex columns on cloud
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.rename(columns=lambda c: c.strip())
-    return df
+    ticker = ticker.strip().upper()
 
-def signal_for(ticker: str) -> dict:
-    df = fetch(ticker)
+    # 1) Try yfinance
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if df is None or df.empty:
+            raise ValueError("yfinance returned empty")
+
+        # yfinance sometimes returns MultiIndex columns on cloud
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.rename(columns=lambda c: c.strip())
+        return df
+    except Exception:
+        pass
+
+    # 2) Fallback: Stooq daily CSV (often works when yfinance is blocked/rate-limited)
+    try:
+        # For US stocks/ETFs, Stooq uses e.g. aapl.us, spy.us
+        stooq_symbol = f"{ticker.lower()}.us"
+        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+        df = pd.read_csv(url)
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # Normalize headers -> Date, Open, High, Low, Close, Volume
+        df.columns = [c.strip().title() for c in df.columns]
+
+        if "Date" not in df.columns or "Close" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+        # Roughly trim to match selected period (keeps app fast)
+        if period == "6mo":
+            df = df.tail(140)
+        elif period == "1y":
+            df = df.tail(260)
+        elif period == "2y":
+            df = df.tail(520)
+
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------- Signal ----------
+def signal_for(ticker: str, period: str) -> dict:
+    df = fetch(ticker, period)
     if df.empty or "Close" not in df.columns:
         return {
-            "ticker": ticker,
+            "ticker": ticker.upper(),
             "signal": "HOLD",
             "confidence": 0.0,
             "price": None,
-            "reasons": ["No data returned."]
+            "reasons": ["No data returned (data source blocked or rate-limited)."],
         }
 
     close = df["Close"].astype(float)
     price = float(close.iloc[-1])
 
-    sma20 = sma(close, 20).iloc[-1]
-    sma50 = sma(close, 50).iloc[-1]
-    sma200 = sma(close, 200).iloc[-1] if len(close) >= 200 else np.nan
-    rsi14 = rsi(close, 14).iloc[-1]
+    sma20 = sma(close, 20)
+    sma50 = sma(close, 50)
+    sma200 = sma(close, 200)
+    rsi14 = rsi(close, 14)
 
     score = 0.0
-    reasons = []
+    reasons: list[str] = []
 
     # Long trend
-    if not np.isnan(sma200):
-        if price > float(sma200):
+    if len(close) >= 200 and not np.isnan(sma200.iloc[-1]):
+        if price > float(sma200.iloc[-1]):
             score += 0.35
             reasons.append("Above 200D avg (uptrend).")
         else:
@@ -65,17 +117,19 @@ def signal_for(ticker: str) -> dict:
         reasons.append("Not enough history for 200D avg.")
 
     # Momentum
-    if not np.isnan(sma20) and not np.isnan(sma50):
-        if float(sma20) > float(sma50):
+    if not np.isnan(sma20.iloc[-1]) and not np.isnan(sma50.iloc[-1]):
+        if float(sma20.iloc[-1]) > float(sma50.iloc[-1]):
             score += 0.25
             reasons.append("20D > 50D (positive momentum).")
         else:
             score -= 0.25
             reasons.append("20D < 50D (weak momentum).")
+    else:
+        reasons.append("Not enough history for 20/50D averages.")
 
     # RSI sanity
-    if not np.isnan(rsi14):
-        rv = float(rsi14)
+    if not np.isnan(rsi14.iloc[-1]):
+        rv = float(rsi14.iloc[-1])
         if rv < 35:
             score += 0.20
             reasons.append(f"RSI {rv:.1f} (oversold-ish).")
@@ -85,6 +139,8 @@ def signal_for(ticker: str) -> dict:
         else:
             score += 0.05
             reasons.append(f"RSI {rv:.1f} (neutral).")
+    else:
+        reasons.append("RSI unavailable.")
 
     # Volatility filter
     rets = close.pct_change().dropna()
@@ -109,12 +165,13 @@ def signal_for(ticker: str) -> dict:
     conf = float(min(1.0, max(0.0, abs(score))))
 
     return {
-        "ticker": ticker,
+        "ticker": ticker.upper(),
         "signal": sig,
         "confidence": conf,
         "price": price,
-        "reasons": reasons
+        "reasons": reasons,
     }
+
 
 # ---------- UI ----------
 left, right = st.columns([2, 1])
@@ -122,25 +179,41 @@ left, right = st.columns([2, 1])
 with left:
     tickers_text = st.text_input("Tickers (comma separated)", value=DEFAULT)
     tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+
 with right:
-    min_conf = st.slider("Min confidence", 0.0, 1.0, 0.35, 0.05)
+    min_conf = st.slider("Min confidence", 0.0, 1.0, 0.20, 0.05)
     period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
-    # Bust cache if user changes period a lot (simple approach)
-    st.caption("Tip: refresh page if you change window often.")
+    st.caption("Tip: raise Min confidence to hide weak signals.")
 
 rows = []
 with st.spinner("Generating signals..."):
     for t in tickers[:50]:
-        # period is not wired into cache key; quick hack: fetch more then compute same
-        rows.append(signal_for(t))
+        rows.append(signal_for(t, period))
 
 df = pd.DataFrame(rows)
-df = df[df["confidence"] >= min_conf].copy()
 df["price"] = pd.to_numeric(df["price"], errors="coerce")
+df = df[df["confidence"] >= float(min_conf)].copy()
 
 st.subheader("Signals")
 st.dataframe(
     df[["ticker", "signal", "confidence", "price"]],
     use_container_width=True,
-    hide_index=True
+    hide_index=True,
 )
+
+st.subheader("Details")
+choice = st.selectbox("Pick a ticker", options=df["ticker"].tolist() if not df.empty else tickers)
+if choice:
+    one = next((r for r in rows if r["ticker"] == choice), None)
+    if one:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.metric("Signal", one["signal"])
+            st.metric("Confidence", f'{one["confidence"]:.2f}')
+            st.metric("Price", "—" if one["price"] is None else f'{float(one["price"]):.2f}')
+            st.write("Chart:")
+            st.write(f"https://finance.yahoo.com/quote/{choice}")
+        with c2:
+            st.write("Why:")
+            for r in one["reasons"]:
+                st.write(f"• {r}")
