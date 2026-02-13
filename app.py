@@ -50,7 +50,7 @@ def _trim_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
 def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
     """
     Stooq CSV downloader (cloud-safe).
-    Very reliable for US equities/ETFs (aapl.us, spy.us).
+    Reliable for many US equities/ETFs and some spot quotes like xagusd.
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     try:
@@ -84,12 +84,13 @@ def _stooq_read(symbol: str, period: str) -> pd.DataFrame:
 
 def _yahoo_get_daily(symbol: str, period: str) -> pd.DataFrame:
     """
-    Yahoo fetch (robust):
+    Yahoo fetch (more robust):
       - yf.download()
-      - then yf.Ticker().history() fallback
+      - yf.Ticker(symbol).history() fallback
     """
     symbol = symbol.strip()
 
+    # 1) download
     try:
         df = yf.download(
             symbol,
@@ -105,6 +106,7 @@ def _yahoo_get_daily(symbol: str, period: str) -> pd.DataFrame:
     except Exception:
         pass
 
+    # 2) history fallback
     try:
         t = yf.Ticker(symbol)
         h = t.history(period=period, interval="1d", auto_adjust=False)
@@ -120,29 +122,30 @@ def _yahoo_get_daily(symbol: str, period: str) -> pd.DataFrame:
 @st.cache_data(ttl=900)  # cache 15 minutes
 def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     """
-    Fetch daily prices.
+    Fetch daily prices with robust fallbacks.
 
-    Strategy:
-      - Try Yahoo first (best general coverage for tickers)
-      - If empty, fall back to Stooq for US equities/ETFs (ticker.us, with BRK-B -> brk.b.us)
+    - For most tickers: try Yahoo first, then Stooq (ticker.us) for US equities/ETFs.
+    - For spot silver: try Yahoo (XAGUSD=X) then Stooq (xagusd).
     """
-    ticker = ticker.strip().upper()
+    t = ticker.strip().upper()
 
-    # A) Yahoo first
-    df = _yahoo_get_daily(ticker, period)
-
-    # Yahoo alias for spot silver
-    if df.empty and ticker == "XAGUSD":
+    # --- Spot silver special-case (stable) ---
+    if t in ("XAGUSD", "XAGUSD=X"):
         df = _yahoo_get_daily("XAGUSD=X", period)
+        if df.empty or "Close" not in df.columns:
+            df = _stooq_read("xagusd", period)
+        return df
 
+    # --- General Yahoo first ---
+    df = _yahoo_get_daily(t, period)
     if not df.empty and "Close" in df.columns:
         return df
 
-    # B) Stooq fallback for US equities/ETFs
-    t_low = ticker.lower()
+    # --- Stooq fallback for US equities/ETFs ---
+    t_low = t.lower()
     candidates = [f"{t_low}.us"]
     if "-" in t_low:
-        candidates.append(f"{t_low.replace('-', '.')}.us")
+        candidates.append(f"{t_low.replace('-', '.')}.us")  # BRK-B -> brk.b.us
 
     for sym in candidates:
         sdf = _stooq_read(sym, period)
@@ -163,7 +166,7 @@ def make_signal(ticker: str, period: str, display_ticker: str | None = None) -> 
             "confidence": 0.0,
             "price": None,
             "status": "NO DATA",
-            "reasons": ["No data returned (ticker unsupported by free sources or temporarily blocked)."],
+            "reasons": ["No data returned (source blocked/rate-limited or symbol unsupported)."],
         }
 
     close = df["Close"].astype(float)
@@ -251,14 +254,13 @@ left, right = st.columns([2, 1])
 
 with left:
     tickers_text = st.text_input("Tickers (comma separated)", value=DEFAULT_TICKERS)
-    tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+    tickers = [x.strip().upper() for x in tickers_text.split(",") if x.strip()]
 
 with right:
     min_conf = st.slider("Min confidence", 0.0, 1.0, 0.20, 0.05)
     period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
     show = st.multiselect("Show", ["BUY", "HOLD", "SELL"], default=["BUY", "HOLD", "SELL"])
     st.caption("Tip: raise Min confidence to hide weak signals.")
-
 
 # ---- Main watchlist ----
 rows = []
@@ -280,31 +282,21 @@ st.dataframe(
     hide_index=True,
 )
 
-
-# ---- Metals (fixed + stable) ----
+# ---- Metals (stable) ----
 st.subheader("Metals")
-st.caption("We use Spot Silver as a stable proxy for silver futures (they move very closely).")
+st.caption("Spot silver is used as a stable proxy for COMEX silver futures (they move very closely).")
 
-# Silver spot:
-#   Yahoo: XAGUSD=X
-# SLV:
-#   Yahoo: SLV
-# Futures proxy:
-#   We simply label spot as 'SIW00 (proxy)' for tracking purposes.
 met_rows = []
 with st.spinner("Updating metals..."):
-    # Spot silver (the clean source)
-    spot = make_signal("XAGUSD=X", period, display_ticker="SIW00 (PROXY)")
-    spot["name"] = "Silver Futures (SIW00 proxy via Spot)"
-    spot["reasons"] = ["Using Spot Silver as a proxy for COMEX silver futures."] + spot.get("reasons", [])
+    proxy = make_signal("XAGUSD", period, display_ticker="SIW00 (PROXY)")
+    proxy["name"] = "Silver Futures (SIW00 proxy via Spot)"
+    proxy["reasons"] = ["Using Spot Silver (XAG/USD) as a proxy for COMEX silver futures."] + proxy.get("reasons", [])
+    met_rows.append(proxy)
+
+    spot = make_signal("XAGUSD", period, display_ticker="XAGUSD (SPOT)")
+    spot["name"] = "Silver Spot (XAG/USD)"
     met_rows.append(spot)
 
-    # Also show spot explicitly (optional clarity)
-    spot2 = make_signal("XAGUSD=X", period, display_ticker="XAGUSD (SPOT)")
-    spot2["name"] = "Silver Spot (XAG/USD)"
-    met_rows.append(spot2)
-
-    # SLV ETF
     slv = make_signal("SLV", period)
     slv["name"] = "SLV ETF"
     met_rows.append(slv)
@@ -331,8 +323,7 @@ with st.expander("Metals details"):
         for r in met_one.get("reasons", []):
             st.write(f"• {r}")
 
-
-# ---- Details (main tickers) ----
+# ---- Details (main watchlist) ----
 st.subheader("Details (Main Watchlist)")
 choices = df_view["ticker"].dropna().tolist()
 default_choice = choices[0] if choices else (tickers[0] if tickers else "SPY")
