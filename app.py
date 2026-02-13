@@ -129,19 +129,19 @@ def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
     """
     t = ticker.strip().upper()
 
-    # --- Spot silver special-case (stable) ---
+    # Spot silver special-case
     if t in ("XAGUSD", "XAGUSD=X"):
         df = _yahoo_get_daily("XAGUSD=X", period)
         if df.empty or "Close" not in df.columns:
             df = _stooq_read("xagusd", period)
         return df
 
-    # --- General Yahoo first ---
+    # Yahoo first
     df = _yahoo_get_daily(t, period)
     if not df.empty and "Close" in df.columns:
         return df
 
-    # --- Stooq fallback for US equities/ETFs ---
+    # Stooq fallback for US equities/ETFs
     t_low = t.lower()
     candidates = [f"{t_low}.us"]
     if "-" in t_low:
@@ -153,6 +153,35 @@ def fetch_prices(ticker: str, period: str) -> pd.DataFrame:
             return sdf
 
     return pd.DataFrame()
+
+
+def _slope_annualized(close: pd.Series, lookback: int = 60) -> float | None:
+    """
+    Annualized slope of log-price over lookback days (approx).
+    Positive -> uptrend acceleration, negative -> downtrend.
+    """
+    close = close.dropna()
+    if len(close) < lookback + 5:
+        return None
+    y = np.log(close.tail(lookback).astype(float).values)
+    x = np.arange(len(y))
+    # slope per day
+    m = np.polyfit(x, y, 1)[0]
+    return float(m * 252.0)  # annualize
+
+
+def _latest(close: pd.Series) -> float | None:
+    close = close.dropna()
+    if close.empty:
+        return None
+    return float(close.iloc[-1])
+
+
+def _ratio_series(a: pd.Series, b: pd.Series) -> pd.Series:
+    df = pd.concat([a.rename("a"), b.rename("b")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float)
+    return (df["a"] / df["b"]).rename("ratio")
 
 
 # ---------------- Signal Engine ----------------
@@ -249,6 +278,159 @@ def make_signal(ticker: str, period: str, display_ticker: str | None = None) -> 
     }
 
 
+# ---------------- Regime Engine ----------------
+def regime_panel(period: str) -> tuple[str, int, pd.DataFrame, list[str]]:
+    """
+    Returns:
+      regime_label, score_int, table_df, notes
+    Score range approx: -5 to +5 (higher = more risk-on).
+    """
+    # Pull required series (use longer history for regime even if UI selects 6mo)
+    hist_period = "2y" if period != "2y" else period
+
+    spy = fetch_prices("SPY", hist_period)
+    vix = fetch_prices("^VIX", hist_period)
+    hyg = fetch_prices("HYG", hist_period)
+    ief = fetch_prices("IEF", hist_period)
+    rsp = fetch_prices("RSP", hist_period)
+    uup = fetch_prices("UUP", hist_period)
+
+    notes: list[str] = []
+    score = 0
+    rows = []
+
+    def add_row(name, state, points, detail):
+        rows.append({"Factor": name, "State": state, "Points": points, "Detail": detail})
+
+    # --- SPY trend: above/below 200D + slope ---
+    if spy.empty or "Close" not in spy.columns:
+        add_row("SPY Trend", "NO DATA", 0, "SPY unavailable")
+    else:
+        c = spy["Close"].astype(float)
+        p = _latest(c)
+        ma200 = _latest(sma(c, 200))
+        sl = _slope_annualized(c, 90)
+
+        pts = 0
+        if p is not None and ma200 is not None:
+            if p > ma200:
+                pts += 1
+                state = "Above 200D"
+            else:
+                pts -= 1
+                state = "Below 200D"
+        else:
+            state = "Unknown"
+
+        if sl is not None:
+            if sl > 0:
+                pts += 1
+                slope_state = "Slope +"
+            else:
+                pts -= 1
+                slope_state = "Slope -"
+        else:
+            slope_state = "Slope ?"
+
+        score += pts
+        add_row("SPY Trend", f"{state}, {slope_state}", pts, f"Slope≈{sl:.2f}" if sl is not None else "Slope NA")
+
+    # --- Volatility: VIX below/above its 50D ---
+    if vix.empty or "Close" not in vix.columns:
+        add_row("Volatility (VIX)", "NO DATA", 0, "VIX unavailable")
+    else:
+        vc = vix["Close"].astype(float)
+        vp = _latest(vc)
+        vma = _latest(sma(vc, 50))
+        pts = 0
+        if vp is not None and vma is not None:
+            if vp < vma:
+                pts += 1
+                state = "Calm (VIX < 50D)"
+            else:
+                pts -= 1
+                state = "Risk (VIX > 50D)"
+        else:
+            state = "Unknown"
+        score += pts
+        add_row("Volatility (VIX)", state, pts, f"VIX={vp:.2f}" if vp is not None else "VIX NA")
+
+    # --- Credit: HYG/IEF ratio trend ---
+    if hyg.empty or ief.empty or "Close" not in hyg.columns or "Close" not in ief.columns:
+        add_row("Credit (HYG/IEF)", "NO DATA", 0, "HYG/IEF unavailable")
+    else:
+        ratio = _ratio_series(hyg["Close"].astype(float), ief["Close"].astype(float))
+        sl = _slope_annualized(ratio, 90)
+        pts = 0
+        if sl is not None:
+            if sl > 0:
+                pts += 1
+                state = "Improving"
+            else:
+                pts -= 1
+                state = "Deteriorating"
+        else:
+            state = "Unknown"
+        score += pts
+        add_row("Credit (HYG/IEF)", state, pts, f"Slope≈{sl:.2f}" if sl is not None else "Slope NA")
+
+    # --- Breadth: RSP/SPY ratio trend ---
+    if rsp.empty or spy.empty or "Close" not in rsp.columns or "Close" not in spy.columns:
+        add_row("Breadth (RSP/SPY)", "NO DATA", 0, "RSP/SPY unavailable")
+    else:
+        ratio = _ratio_series(rsp["Close"].astype(float), spy["Close"].astype(float))
+        sl = _slope_annualized(ratio, 90)
+        pts = 0
+        if sl is not None:
+            if sl > 0:
+                pts += 1
+                state = "Broadening"
+            else:
+                pts -= 1
+                state = "Narrowing"
+        else:
+            state = "Unknown"
+        score += pts
+        add_row("Breadth (RSP/SPY)", state, pts, f"Slope≈{sl:.2f}" if sl is not None else "Slope NA")
+
+    # --- Dollar: UUP trend (strong dollar often tightens conditions) ---
+    if uup.empty or "Close" not in uup.columns:
+        add_row("Dollar (UUP)", "NO DATA", 0, "UUP unavailable")
+    else:
+        uc = uup["Close"].astype(float)
+        sl = _slope_annualized(uc, 90)
+        pts = 0
+        if sl is not None:
+            if sl > 0:
+                pts -= 1
+                state = "Strengthening (headwind)"
+            else:
+                pts += 1
+                state = "Weakening (tailwind)"
+        else:
+            state = "Unknown"
+        score += pts
+        add_row("Dollar (UUP)", state, pts, f"Slope≈{sl:.2f}" if sl is not None else "Slope NA")
+
+    # Regime mapping
+    if score >= 2:
+        regime = "RISK ON"
+    elif score <= -2:
+        regime = "RISK OFF"
+    else:
+        regime = "NEUTRAL"
+
+    # Notes / suggestions
+    if regime == "RISK ON":
+        notes.append("Suggested equity exposure: 80–100% (stay invested, rotate within strength).")
+    elif regime == "NEUTRAL":
+        notes.append("Suggested equity exposure: 50–70% (be selective, avoid overtrading).")
+    else:
+        notes.append("Suggested equity exposure: 20–40% (defensive posture, reduce drawdown risk).")
+
+    return regime, int(score), pd.DataFrame(rows), notes
+
+
 # ---------------- UI ----------------
 left, right = st.columns([2, 1])
 
@@ -261,6 +443,22 @@ with right:
     period = st.selectbox("History window", ["6mo", "1y", "2y"], index=1)
     show = st.multiselect("Show", ["BUY", "HOLD", "SELL"], default=["BUY", "HOLD", "SELL"])
     st.caption("Tip: raise Min confidence to hide weak signals.")
+
+# ---- Market Regime ----
+st.subheader("Market Regime")
+with st.spinner("Calculating regime..."):
+    regime, rscore, rtable, rnotes = regime_panel(period)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Regime", regime)
+c2.metric("Regime Score", rscore)
+c3.metric("Cache", "15 min")
+
+st.dataframe(rtable, use_container_width=True, hide_index=True)
+for n in rnotes:
+    st.write(f"• {n}")
+
+st.divider()
 
 # ---- Main watchlist ----
 rows = []
